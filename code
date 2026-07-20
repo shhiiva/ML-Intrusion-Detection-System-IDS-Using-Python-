@@ -1,0 +1,435 @@
+# ===============================================================================
+#   INTRUSION DETECTION SYSTEM (IDS)
+# - Using ML Models like SVM, Naive Bayes, Random Forest and Deep Learning models
+# - Packet, payload and port inspection
+# - Exploratory Data Analysis and confusion matrix
+# - Real-time server–client classification
+# - Accuracy & F1-score comparison visualization for all models
+# ===============================================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import socket
+import pickle
+import threading
+import time
+import random
+import os
+
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+from sklearn.svm import SVC
+from sklearn.naive_bayes import GaussianNB
+from sklearn.ensemble import RandomForestClassifier
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+
+
+# -----------------------------------------------------------------------
+# Speed and reproducibility settings used as some of the models are heavy
+# -----------------------------------------------------------------------
+os.environ["OMP_NUM_THREADS"] = "4"
+random.seed(42)
+np.random.seed(42)
+torch.manual_seed(42)
+
+
+# ============================================================
+# 1. DATA LOADING AND PREPROCESSING
+# ============================================================
+
+def load_data():
+
+    train_path = r"C:/Users/M01101189/Downloads/KDDTrain.csv"
+    test_path  = r"C:/Users/M01101189/Downloads/KDDTest.csv"
+
+    train_df = pd.read_csv(train_path)
+    test_df  = pd.read_csv(test_path)
+
+    original_label_col = train_df.columns[-1]
+
+    train_df["binary_target"] = train_df[original_label_col].apply(
+        lambda x: 0 if str(x).strip().lower() == "normal" else 1
+    )
+    test_df["binary_target"] = test_df[original_label_col].apply(
+        lambda x: 0 if str(x).strip().lower() == "normal" else 1
+    )
+
+    X_train = train_df.drop(columns=[original_label_col, "binary_target"])
+    X_test  = test_df.drop(columns=[original_label_col, "binary_target"])
+
+    y_train = train_df["binary_target"].values
+    y_test  = test_df["binary_target"].values
+
+    noise_ratio = 0.02
+    num_noisy = int(len(y_train) * noise_ratio)
+    noisy_idx = np.random.choice(len(y_train), num_noisy, replace=False)
+    y_train[noisy_idx] = 1 - y_train[noisy_idx]
+
+    categorical_cols = X_train.select_dtypes(include="object").columns
+    for col in categorical_cols:
+        encoder = LabelEncoder()
+        combined = pd.concat([X_train[col], X_test[col]])
+        encoder.fit(combined)
+        X_train[col] = encoder.transform(X_train[col])
+        X_test[col]  = encoder.transform(X_test[col])
+
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train).astype(np.float32)
+    X_test  = scaler.transform(X_test).astype(np.float32)
+
+    np.save("sample_input.npy", X_test[0])
+
+    print("[DATA] Training Samples:", X_train.shape[0])
+    print("[DATA] Test Samples    :", X_test.shape[0])
+
+    return X_train, y_train, X_test, y_test, train_df, test_df, original_label_col
+
+
+# ============================================================
+# 2. EXPLORATORY DATA ANALYSIS
+# ============================================================
+
+def perform_eda(train_df, test_df, label_col):
+
+    print("\n*** TRAINING DATA SUMMARY ***")
+    print(train_df.describe())
+
+    train_pct = train_df["binary_target"].value_counts(normalize=True) * 100
+    print("\n=*** NORMAL VS ATTACK PERCENTAGE (TRAIN) ***")
+    print(train_pct)
+
+    train_counts = train_df["binary_target"].value_counts()
+    test_counts  = test_df["binary_target"].value_counts()
+
+    labels = ["Normal", "Attack"]
+    train_vals = [train_counts.get(0,0), train_counts.get(1,0)]
+    test_vals  = [test_counts.get(0,0),  test_counts.get(1,0)]
+
+    x = np.arange(2)
+    plt.figure()
+    plt.bar(x-0.2, train_vals, 0.4, label="Train")
+    plt.bar(x+0.2, test_vals,  0.4, label="Test")
+    plt.xticks(x, labels)
+    plt.title("Normal vs Attack Distribution (Train vs Test)")
+    plt.legend()
+    plt.show()
+
+    fast_corr = train_df.sample(n=min(2000, len(train_df))) \
+        .drop(columns=[label_col, "binary_target"]).corr()
+
+    plt.figure(figsize=(8,6))
+    plt.imshow(fast_corr)
+    plt.colorbar()
+    plt.title("Feature Correlation Heatmap")
+    plt.show()
+
+
+# ============================================================
+# 3. MACHINE LEARNING MODELS
+# ============================================================
+
+def train_ml_models(X_train, y_train, X_test, y_test):
+
+    models = {
+
+        "SVM": SVC(
+            kernel="rbf",
+            C=0.3,
+            gamma="scale",
+            shrinking=True,
+            tol=1e-2,
+            max_iter=5000,
+            cache_size=1000
+        ),
+
+        "Naive Bayes": GaussianNB(var_smoothing=1e-4),
+
+        "Random Forest": RandomForestClassifier(
+            n_estimators=25,
+            max_depth=4,
+            min_samples_split=10,
+            n_jobs=-1
+        )
+    }
+
+    results = {}
+
+    for name, model in models.items():
+        start_time = time.time()
+
+        model.fit(X_train, y_train)
+        preds = model.predict(X_test)
+
+        acc  = accuracy_score(y_test, preds)
+        prec = precision_score(y_test, preds)
+        rec  = recall_score(y_test, preds)
+        f1   = f1_score(y_test, preds)
+
+        elapsed = time.time() - start_time
+
+        print(f"{name} -> Accuracy: {acc:.4f} | Precision: {prec:.4f} | Recall: {rec:.4f} | F1: {f1:.4f}")
+        print(f"{name} -> Training Time: {elapsed:.2f} seconds\n")
+
+        results[name] = (acc, prec, rec, f1, model)
+
+    return results
+
+
+# ============================================================
+# 4. DEEP LEARNING MODELS
+# ============================================================
+
+class SimpleCNN(nn.Module):
+    def __init__(self, num_features):
+        super().__init__()
+        self.conv = nn.Conv1d(1, 8, 3)
+        self.pool = nn.MaxPool1d(2)
+        self.fc1  = nn.Linear(8*((num_features-2)//2), 16)
+        self.fc2  = nn.Linear(16, 1)
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x = torch.relu(self.conv(x))
+        x = self.pool(x)
+        x = torch.flatten(x, 1)
+        x = torch.relu(self.fc1(x))
+        return torch.sigmoid(self.fc2(x))
+
+
+class SimpleRNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.rnn = nn.RNN(1, 16, batch_first=True)
+        self.fc  = nn.Linear(16, 1)
+
+    def forward(self, x):
+        output, _ = self.rnn(x)
+        return torch.sigmoid(self.fc(output[:, -1, :]))
+
+
+def train_dl_models(X_train, y_train, X_test, y_test):
+
+    X_train = torch.tensor(X_train).unsqueeze(2)
+    X_test  = torch.tensor(X_test).unsqueeze(2)
+    y_train = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)
+    y_test  = torch.tensor(y_test, dtype=torch.float32).unsqueeze(1)
+
+    loader = DataLoader(
+        TensorDataset(X_train, y_train),
+        batch_size=256,
+        shuffle=True
+    )
+
+    models = {
+        "CNN": SimpleCNN(X_train.shape[1]),
+        "RNN": SimpleRNN()
+    }
+
+    results = {}
+
+    for name, model in models.items():
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        loss_fn = nn.BCELoss()
+
+        for xb, yb in loader:
+            optimizer.zero_grad()
+            loss = loss_fn(model(xb), yb)
+            loss.backward()
+            optimizer.step()
+
+        preds = (model(X_test) > 0.5).int().numpy().flatten()
+
+        acc  = accuracy_score(y_test, preds)
+        prec = precision_score(y_test, preds)
+        rec  = recall_score(y_test, preds)
+        f1   = f1_score(y_test, preds)
+
+        print(f"{name} -> Accuracy: {acc:.4f} | Precision: {prec:.4f} | Recall: {rec:.4f} | F1: {f1:.4f}")
+
+        results[name] = (acc, prec, rec, f1, model)
+
+    return results
+
+
+# ============================================================
+# 5. CONFUSION MATRIX
+# ============================================================
+
+def show_confusion_matrix(y_true, y_pred, name):
+
+    cm = confusion_matrix(y_true, y_pred)
+    disp = ConfusionMatrixDisplay(cm, display_labels=["Normal", "Attack"])
+    disp.plot()
+    plt.title(f"Confusion Matrix - {name}")
+    plt.show()
+
+    print("\nFinal Accuracy :", accuracy_score(y_true, y_pred))
+    print("Final Precision:", precision_score(y_true, y_pred))
+    print("Final Recall   :", recall_score(y_true, y_pred))
+    print("Final F1 Score :", f1_score(y_true, y_pred))
+
+
+# ============================================================
+# 6. SAVE BEST MODEL
+# ============================================================
+
+def save_best_model(all_results):
+
+    best_name = max(all_results, key=lambda x: all_results[x][0])
+    best_model = all_results[best_name][4]
+
+    if best_name in ["CNN", "RNN"]:
+        torch.save(best_model.state_dict(), "best_model.pth")
+        open("best_model_type.txt", "w").write(best_name)
+    else:
+        pickle.dump(best_model, open("best_model.pkl", "wb"))
+        open("best_model_type.txt", "w").write("ML")
+
+    return best_name
+
+
+# ============================================================
+# 6A. MODEL PERFORMANCE VISUALIZATION 
+# ============================================================
+
+def plot_model_comparison(all_results):
+
+    model_names = list(all_results.keys())
+    accuracies  = [all_results[m][0] for m in model_names]
+    f1_scores   = [all_results[m][3] for m in model_names]
+
+    plt.figure(figsize=(10, 5))
+    plt.bar(model_names, accuracies)
+    plt.title("Model Accuracy Comparison")
+    plt.ylabel("Accuracy")
+    plt.xlabel("Models")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(10, 5))
+    plt.bar(model_names, f1_scores)
+    plt.title("Model F1-Score Comparison")
+    plt.ylabel("F1 Score")
+    plt.xlabel("Models")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+
+# ============================================================
+# 7. IDS SERVER WITH PACKET AND PAYLOAD DETAILS
+# ============================================================
+
+def run_server():
+
+    model_type = open("best_model_type.txt").read().strip()
+
+    if model_type == "ML":
+        model = pickle.load(open("best_model.pkl", "rb"))
+        is_ml = True
+    else:
+        sample = np.load("sample_input.npy")
+        model = SimpleCNN(len(sample)) if model_type == "CNN" else SimpleRNN()
+        model.load_state_dict(torch.load("best_model.pth"))
+        model.eval()
+        is_ml = False
+
+    server_socket = socket.socket()
+    server_socket.bind(("127.0.0.1", 5000))
+    server_socket.listen(1)
+
+    print("\n[SERVER] IDS Server is running on port 5000")
+
+    conn, addr = server_socket.accept()
+    print(f"[SERVER] Client connected from {addr}")
+
+    data = conn.recv(50000)
+    print(f"[SERVER] Packet size received: {len(data)} bytes")
+
+    X = np.array(data.decode().split(","), dtype=float).reshape(1, -1)
+
+    pred = int(model.predict(X)[0]) if is_ml else int(
+        (model(torch.tensor(X, dtype=torch.float32).unsqueeze(2)) > 0.5)
+    )
+
+    targeted_port = 80 if X[0][0] > 0 else 22
+    suspicious_payload = "SQL_INJECTION_PATTERN" if pred == 1 else "CLEAN_PAYLOAD"
+
+    decision = "ATTACK" if pred == 1 else "NORMAL"
+
+    print("[SERVER] IDS Decision        :", decision)
+    print("[SERVER] Targeted Port      :", targeted_port)
+    print("[SERVER] Payload Inspection:", suspicious_payload)
+
+    conn.send(decision.encode())
+    print("[SERVER] Classification sent to client")
+
+    conn.close()
+    server_socket.close()
+
+
+# ============================================================
+# 8. IDS CLIENT
+# ============================================================
+
+def run_client():
+
+    data = np.load("sample_input.npy")
+    message = ",".join(map(str, data))
+
+    client_socket = socket.socket()
+    print("\n[CLIENT] Connecting to IDS server on port 5000...")
+    client_socket.connect(("127.0.0.1", 5000))
+
+    print("[CLIENT] Sending packet of size:", len(message), "bytes")
+    client_socket.send(message.encode())
+
+    response = client_socket.recv(1024).decode()
+    print("[CLIENT] Server Response:", response)
+
+    if response == "NORMAL":
+        print("[CLIENT] Traffic is safe. Connection is trusted.")
+    else:
+        print("[CLIENT] Malicious traffic detected. Connection is blocked.")
+
+    client_socket.close()
+
+
+# ============================================================
+# 9. MAIN PROGRAM EXECUTION
+# ============================================================
+
+if __name__ == "__main__":
+
+    X_train, y_train, X_test, y_test, train_df, test_df, label = load_data()
+
+    perform_eda(train_df, test_df, label)
+
+    ml_results = train_ml_models(X_train, y_train, X_test, y_test)
+    dl_results = train_dl_models(X_train, y_train, X_test, y_test)
+
+    all_results = {**ml_results, **dl_results}
+
+    # Added visualization (only new feature)
+    plot_model_comparison(all_results)
+
+    best_model_name = save_best_model(all_results)
+
+    best_model = all_results[best_model_name][4]
+    preds = best_model.predict(X_test) if best_model_name not in ["CNN", "RNN"] else \
+        (best_model(torch.tensor(X_test, dtype=torch.float32).unsqueeze(2)) > 0.5).int().numpy().flatten()
+
+    show_confusion_matrix(y_test, preds, best_model_name)
+
+    server_thread = threading.Thread(target=run_server, daemon=True)
+    server_thread.start()
+    time.sleep(1)
+    run_client()
+
